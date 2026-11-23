@@ -425,7 +425,7 @@ index b4c15d8..87afb2c 100644
  
  // ---------------------------------------------------------------------------
 diff --git a/runtime/include/cafe/runtime.h b/runtime/include/cafe/runtime.h
-index 49e556a..a61c2d4 100644
+index 49e556a..1787bb6 100644
 --- a/runtime/include/cafe/runtime.h
 +++ b/runtime/include/cafe/runtime.h
 @@ -11,6 +11,7 @@
@@ -436,12 +436,25 @@ index 49e556a..a61c2d4 100644
  
  // ---------------------------------------------------------------- memory
  // One 4 GiB host reservation mirrors the guest address space. Only committed
-@@ -41,6 +42,8 @@ std::string sha256_hex(const std::vector<uint8_t>& data);
+@@ -41,6 +42,21 @@ std::string sha256_hex(const std::vector<uint8_t>& data);
  
  // ---------------------------------------------------------------- dispatch
  void build_dispatch_table();
 +// A module's translated function, for indirect calls (port/patch_modules.py).
 +void register_guest_function(uint32_t address, PPCFunc* function);
++// port/patch_dynload_modules.py: extra room in the indirect-call table (set before main, e.g. by a
++// static initializer of a port with many modules).
++extern size_t g_dispatch_extra_entries;
++// Game modules the port loads when the title asks OSDynLoad for them (null = none).
++struct GameModuleHooks {
++    // true: name is a game module; it is loaded (entry run on first use) and *handle set.
++    bool (*acquire)(const char* name, uint32_t* handle);
++    // -1: not a game module's handle; 0: found (*address set); 1: no such export.
++    int (*find_export)(uint32_t handle, bool is_data, const char* name, uint32_t* address);
++    // true: handle was a game module's.
++    bool (*release)(uint32_t handle);
++};
++extern const GameModuleHooks* g_game_module_hooks;
  // Gives a native function a guest-visible address (for function pointers the
  // guest stores and calls, e.g. MEMAllocFromDefaultHeap's value).
  uint32_t register_host_function(PPCFunc* function, const char* name);
@@ -518,19 +531,21 @@ index b5cbc80..38feb6d 100644
      // game says the connection could not be made.
      if (m == "nn_olv" || m == "nn_olv2" || m == "nn_boss" || m == "nn_uds") {
 diff --git a/runtime/src/dispatch.cpp b/runtime/src/dispatch.cpp
-index 0516e5a..aafd3d3 100644
+index 0516e5a..d3f38f1 100644
 --- a/runtime/src/dispatch.cpp
 +++ b/runtime/src/dispatch.cpp
-@@ -41,8 +41,11 @@ void insert(uint32_t address, PPCFunc* function, bool compiled) {
+@@ -41,8 +41,13 @@ void insert(uint32_t address, PPCFunc* function, bool compiled) {
  
  } // namespace
  
++size_t g_dispatch_extra_entries = 0x40000; // port/patch_dynload_modules.py
++
 +// port/patch_modules.py: a translated module's functions (it is loaded after the title).
 +void register_guest_function(uint32_t address, PPCFunc* function) { insert(address, function, function != nullptr); }
 +
  void build_dispatch_table() {
 -    const size_t wanted = (cafe_guest_function_count + cafe_guest_import_count + 0x10000) * 2;
-+    const size_t wanted = (cafe_guest_function_count + cafe_guest_import_count + 0x40000) * 2; // + modules
++    const size_t wanted = (cafe_guest_function_count + cafe_guest_import_count + g_dispatch_extra_entries) * 2; // + modules
      size_t capacity = 1;
      while (capacity < wanted) {
          capacity <<= 1;
@@ -3855,6 +3870,28 @@ index cec93d5..5217d87 100644
  void reserve_guest_memory() {
      if (g_base != nullptr) {
          return;
+diff --git a/runtime/src/os/alarm.cpp b/runtime/src/os/alarm.cpp
+index ec0c7ac..2080905 100644
+--- a/runtime/src/os/alarm.cpp
++++ b/runtime/src/os/alarm.cpp
+@@ -18,6 +18,7 @@
+ extern "C" uint64_t cafe_ppc_timebase(void);
+ 
+ namespace cafe::os {
++int64_t os_time_offset(); // port/patch_periodic_alarm.py
+ 
+ Thread* create_internal_thread(const char* name, int core);
+ 
+@@ -119,6 +120,9 @@ bool OSSetAlarm(GuestAddress alarm, uint64_t delay, uint32_t handler) {
+ 
+ // First fire at `start` (system ticks), then every `period` ticks.
+ bool OSSetPeriodicAlarm(GuestAddress alarm, uint64_t start, uint64_t period, uint32_t handler) {
++    // port/patch_periodic_alarm.py: an OSTime start (from OSGetTime) to the system time base
++    const int64_t offset = os_time_offset();
++    if (offset > 0 && start >= static_cast<uint64_t>(offset)) start -= static_cast<uint64_t>(offset);
+     uint64_t when = start;
+     const uint64_t now = cafe_ppc_timebase();
+     if (period != 0 && when < now) when += (now - when + period - 1) / period * period;
 diff --git a/runtime/src/os/ax.cpp b/runtime/src/os/ax.cpp
 index efe3675..a03b91b 100644
 --- a/runtime/src/os/ax.cpp
@@ -4076,7 +4113,7 @@ index 0205845..c55d43d 100644
 +
  } // namespace cafe::os
 diff --git a/runtime/src/os/coreinit_misc.cpp b/runtime/src/os/coreinit_misc.cpp
-index 50b2c1e..0faaa54 100644
+index 50b2c1e..704f519 100644
 --- a/runtime/src/os/coreinit_misc.cpp
 +++ b/runtime/src/os/coreinit_misc.cpp
 @@ -2,6 +2,7 @@
@@ -4097,8 +4134,15 @@ index 50b2c1e..0faaa54 100644
  void DCInvalidateRange(uint32_t, uint32_t) {}
  void DCZeroRange(GuestAddress address, uint32_t size) {
      const uint32_t begin = address.value & ~31u;
+@@ -551,4 +553,6 @@ static void init_stdio_cleanup(uint32_t address) { g_stdio_cleanup = address; }
+ CAFE_DATA_EXPORT(coreinit, __atexit_cleanup, init_atexit_cleanup);
+ CAFE_DATA_EXPORT(coreinit, __stdio_cleanup, init_stdio_cleanup);
+ 
++// port/patch_periodic_alarm.py: OSGetTime minus the system time base.
++int64_t os_time_offset() { return ticks_since_2000() - static_cast<int64_t>(cafe_ppc_timebase()); }
+ } // namespace cafe::os
 diff --git a/runtime/src/os/dynload.cpp b/runtime/src/os/dynload.cpp
-index 83aa787..f1d3f99 100644
+index 83aa787..8bcb2b0 100644
 --- a/runtime/src/os/dynload.cpp
 +++ b/runtime/src/os/dynload.cpp
 @@ -2,6 +2,8 @@
@@ -4110,7 +4154,29 @@ index 83aa787..f1d3f99 100644
  
  #include "cafe/export.h"
  #include "cafe/runtime.h"
-@@ -35,6 +37,7 @@ uint32_t OSDynLoad_Acquire(uint32_t name, be<uint32_t>* handle) {
+@@ -12,6 +14,10 @@
+ #include <map>
+ #include <string>
+ 
++namespace cafe {
++const GameModuleHooks* g_game_module_hooks = nullptr; // port/patch_dynload_modules.py
++}
++
+ namespace cafe::os {
+ namespace {
+ 
+@@ -32,9 +38,18 @@ void unimplemented_dynamic_export(PPCContext& ctx, uint8_t*) {
+ }
+ 
+ uint32_t OSDynLoad_Acquire(uint32_t name, be<uint32_t>* handle) {
++    if (g_game_module_hooks != nullptr && name != 0) { // port/patch_dynload_modules.py
++        uint32_t h = 0;
++        const std::string wanted(guest_string(name));
++        if (g_game_module_hooks->acquire(wanted.c_str(), &h)) {
++            if (handle) *handle = h;
++            return 0;
++        }
++    }
      KernelLock lock(kernel_mutex());
      std::string module(guest_string(name));
      if (module.size() > 4 && module.compare(module.size() - 4, 4, ".rpl") == 0) module.resize(module.size() - 4);
@@ -4118,7 +4184,22 @@ index 83aa787..f1d3f99 100644
      for (const auto& [h, m] : g_modules) {
          if (m == module) {
              if (handle) *handle = h;
-@@ -54,6 +57,7 @@ uint32_t OSDynLoad_FindExport(uint32_t handle, uint32_t is_data, uint32_t name,
+@@ -49,11 +64,22 @@ uint32_t OSDynLoad_Acquire(uint32_t name, be<uint32_t>* handle) {
+ }
+ 
+ uint32_t OSDynLoad_FindExport(uint32_t handle, uint32_t is_data, uint32_t name, be<uint32_t>* address) {
++    if (g_game_module_hooks != nullptr && name != 0) { // port/patch_dynload_modules.py
++        uint32_t a = 0;
++        const std::string wanted(guest_string(name));
++        const int r = g_game_module_hooks->find_export(handle, is_data != 0, wanted.c_str(), &a);
++        if (r == 0) {
++            if (address) *address = a;
++            return 0;
++        }
++        if (r == 1) return 0xBAD10001u; // OSDynLoad: export not found
++    }
+     KernelLock lock(kernel_mutex());
+     const auto module = g_modules.find(handle);
      if (module == g_modules.end()) return kError;
      const std::string symbol(guest_string(name));
      const std::string key = module->second + ":" + symbol;
@@ -4126,6 +4207,17 @@ index 83aa787..f1d3f99 100644
      if (is_data) {
          auto it = g_data_objects.find(key);
          if (it == g_data_objects.end()) {
+@@ -85,7 +111,9 @@ uint32_t OSDynLoad_FindExport(uint32_t handle, uint32_t is_data, uint32_t name,
+     return 0;
+ }
+ 
+-void OSDynLoad_Release(uint32_t) {}
++void OSDynLoad_Release(uint32_t handle) {
++    if (g_game_module_hooks != nullptr) g_game_module_hooks->release(handle); // port/patch_dynload_modules.py
++}
+ 
+ // Modules are not loaded into guest memory, so the allocator is never used.
+ uint32_t OSDynLoad_SetAllocator(uint32_t, uint32_t) { return 0; }
 diff --git a/runtime/src/os/fs.cpp b/runtime/src/os/fs.cpp
 index 404cc34..690a354 100644
 --- a/runtime/src/os/fs.cpp
@@ -4241,7 +4333,7 @@ index 404cc34..690a354 100644
  CAFE_EXPORT(coreinit, FSRemove, FSRemove);
  CAFE_EXPORT(coreinit, FSRename, FSRename);
 diff --git a/runtime/src/os/heap.cpp b/runtime/src/os/heap.cpp
-index 552bb84..70cc56f 100644
+index 552bb84..d1234df 100644
 --- a/runtime/src/os/heap.cpp
 +++ b/runtime/src/os/heap.cpp
 @@ -17,6 +17,10 @@
@@ -4380,7 +4472,17 @@ index 552bb84..70cc56f 100644
      exp_free(exp_heap(heap), payload);
  }
  
-@@ -303,6 +385,15 @@ uint32_t MEMGetTotalFreeSizeForExpHeap(uint32_t heap) {
+@@ -288,6 +370,9 @@ void run_preinit_user(PPCContext& ctx, uint32_t function) {
+     g_base_heaps[1] = __builtin_bswap32(guest[2]);
+ }
+ 
++// port/patch_find_contain_heap.py
++uint32_t MEMFindContainHeap(uint32_t pointer) { return containing_heap(pointer, pointer + 1, 0); }
++CAFE_EXPORT(coreinit, MEMFindContainHeap, MEMFindContainHeap);
+ CAFE_EXPORT(coreinit, MEMCreateExpHeapEx, MEMCreateExpHeapEx);
+ CAFE_EXPORT(coreinit, MEMDestroyExpHeap, MEMDestroyExpHeap);
+ CAFE_EXPORT(coreinit, MEMAllocFromExpHeapEx, MEMAllocFromExpHeapEx);
+@@ -303,6 +388,15 @@ uint32_t MEMGetTotalFreeSizeForExpHeap(uint32_t heap) {
  
  // shortcut: allocations always come first-fit; honour the mode if a title depends on placement.
  uint32_t MEMSetAllocModeForExpHeap(uint32_t, uint32_t) { return 0; }
@@ -4396,7 +4498,7 @@ index 552bb84..70cc56f 100644
  
  uint32_t MEMGetAllocatableSizeForFrmHeapEx(uint32_t handle, int32_t alignment) {
      std::lock_guard lock(g_heap_mutex);
-@@ -324,10 +415,104 @@ void MEMFreeToAllocator(PPCContext& ctx, GuestAddress allocator, uint32_t block)
+@@ -324,10 +418,104 @@ void MEMFreeToAllocator(PPCContext& ctx, GuestAddress allocator, uint32_t block)
      call_guest(ctx, *guest<be<uint32_t>>(functions + 4), {allocator.value, block});
  }
  
@@ -4992,7 +5094,7 @@ index 730f01e..970a7c9 100644
  }
  Result act_mii_ex(uint8_t* data, uint8_t) {
 diff --git a/runtime/src/os/offline_services.cpp b/runtime/src/os/offline_services.cpp
-index b1de21c..634abf7 100644
+index b1de21c..95eeb15 100644
 --- a/runtime/src/os/offline_services.cpp
 +++ b/runtime/src/os/offline_services.cpp
 @@ -10,6 +10,7 @@
@@ -5003,7 +5105,41 @@ index b1de21c..634abf7 100644
  #include <cstring>
  #include <filesystem>
  #include <string>
-@@ -228,14 +229,22 @@ CAFE_EXPORT(nlibcurl, curl_global_init, curl_failed_init);
+@@ -135,22 +136,10 @@ CAFE_EXPORT(nn_nfp, OpenApplicationArea__Q2_2nn3nfpFUi, nfp_no_tag);
+ CAFE_EXPORT(nn_nfp, ReadApplicationArea__Q2_2nn3nfpFPvUi, nfp_no_tag);
+ CAFE_EXPORT(nn_nfp, WriteApplicationArea__Q2_2nn3nfpFPCvUiRCQ3_2nn3nfp5TagId, nfp_no_tag);
+ 
++// port/patch_h264.py: h264 now in port/os_extra.cpp.
+ // Video decoding (h264): not available yet, so every call fails and titles
+ // skip their movies.
+ // shortcut: no decoder; bridge to a host H.264 decoder when the movies should play.
+-CAFE_EXPORT(h264, H264DECGetImageSize, no_device);
+-CAFE_EXPORT(h264, H264DECMemoryRequirement, no_device);
+-CAFE_EXPORT(h264, H264DECCheckMemSegmentation, no_device);
+-CAFE_EXPORT(h264, H264DECInitParam, no_device);
+-CAFE_EXPORT(h264, H264DECOpen, no_device);
+-CAFE_EXPORT(h264, H264DECBegin, no_device);
+-CAFE_EXPORT(h264, H264DECSetBitstream, no_device);
+-CAFE_EXPORT(h264, H264DECExecute, no_device);
+-CAFE_EXPORT(h264, H264DECEnd, no_device);
+-CAFE_EXPORT(h264, H264DECClose, no_device);
+-CAFE_EXPORT(h264, H264DECSetParam_FPTR_OUTPUT, no_device);
+-CAFE_EXPORT(h264, H264DECSetParam_OUTPUT_PER_FRAME, no_device);
+-CAFE_EXPORT(h264, H264DECSetParam_USER_MEMORY, no_device);
+ 
+ // A DLC title for AOC_ListTitle, its content/ folder mounted at /vol/aoc<id>.
+ void register_aoc(uint64_t id, uint32_t group, uint16_t version, const std::filesystem::path& content) {
+@@ -185,9 +174,6 @@ CAFE_EXPORT(padscore, WENCGetEncodeData, zero);
+ CAFE_EXPORT(padscore, WPADInit, no_op);
+ CAFE_EXPORT(padscore, WPADSetExtensionCallback, zero);
+ CAFE_EXPORT(padscore, WPADGetInfoAsync, no_device);
+-CAFE_EXPORT(padscore, WPADCanSendStreamData, zero);
+-CAFE_EXPORT(padscore, WPADSendStreamData, no_device);
+-CAFE_EXPORT(padscore, WPADControlSpeaker, no_device);
+ 
+ // GamePad extras.
+ CAFE_EXPORT(vpad, VPADEnableStickCrossClamp, no_op);
+@@ -228,14 +214,22 @@ CAFE_EXPORT(nlibcurl, curl_global_init, curl_failed_init);
  CAFE_EXPORT(sysapp, SYSGetArguments, zero);
  CAFE_EXPORT(sysapp, SYSSwitchToEManual, no_op);
  CAFE_EXPORT(sysapp, SYSSwitchToEShop, no_op);
@@ -5443,7 +5579,7 @@ index 852f5d4..d68e479 100644
      static constexpr Setting kSettings[] = {
          {"cafe.language", kLanguageEnglish},
 diff --git a/runtime/src/os/thread.cpp b/runtime/src/os/thread.cpp
-index 903c088..55b2d6e 100644
+index 903c088..5332ec3 100644
 --- a/runtime/src/os/thread.cpp
 +++ b/runtime/src/os/thread.cpp
 @@ -247,6 +247,20 @@ void run_profile(double start, double seconds, std::string path) {
@@ -5467,7 +5603,32 @@ index 903c088..55b2d6e 100644
      // TTT2_DUMP_THREADS_AT=seconds: then, each guest thread's name and where it is in guest code
      // (its last call out: the LR and the saved return addresses), for finding what a title waits on.
      if (const char* at = std::getenv("TTT2_DUMP_THREADS_AT")) {
-@@ -298,6 +312,11 @@ void* host_main(void* argument) {
+@@ -281,7 +295,23 @@ void request_profile_now() {
+ #else
+ void note_profile_thread(uint32_t) {}
+ void forget_profile_thread() {}
+-void start_profiler() {}
++void start_profiler() {
++    // port/patch_dump_threads_linux.py: TTT2_DUMP_THREADS_AT=seconds (as on Windows)
++    if (const char* at = std::getenv("TTT2_DUMP_THREADS_AT")) {
++        const double seconds = std::atof(at);
++        std::thread([seconds] {
++            std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
++            KernelLock lock(g_kernel);
++            for (const auto& [guest, t] : g_threads) {
++                const uint32_t name = field<uint32_t>(guest, kName);
++                std::fprintf(stderr, "thread %08X \"%s\" state %u:\n", guest,
++                             name ? std::string(guest_string(name)).c_str() : "", state_of(guest));
++                dump_backtrace(t->ctx);
++            }
++            std::fflush(stderr);
++        }).detach();
++    }
++}
+ void request_profile_now() {}
+ #endif
+ 
+@@ -298,6 +328,11 @@ void* host_main(void* argument) {
      if (setjmp(t->exit_jump) == 0) {
          const uint32_t entry = field<uint32_t>(t->guest, kEntry);
          if (t == g_main_thread && g_preinit_user != 0) run_preinit_user(t->ctx, g_preinit_user);
@@ -5479,7 +5640,7 @@ index 903c088..55b2d6e 100644
          cafe_ppc_lookup(entry)(t->ctx, guest_base());
          exit_value = t->ctx.r[3];
      } else {
-@@ -426,6 +445,13 @@ Thread* thread_for(uint32_t guest_thread) {
+@@ -426,6 +461,13 @@ Thread* thread_for(uint32_t guest_thread) {
      return it == g_threads.end() ? nullptr : it->second;
  }
  
@@ -5493,7 +5654,23 @@ index 903c088..55b2d6e 100644
  Thread* create_internal_thread(const char* name, int core) {
      KernelLock lock(g_kernel);
      return make_internal_thread(name, 0x10000, core);
-@@ -534,7 +560,14 @@ int32_t OSResumeThread(GuestAddress thread) {
+@@ -510,6 +552,15 @@ bool OSCreateThread(GuestAddress thread, uint32_t entry, uint32_t argc, uint32_t
+     }
+     init_guest_thread(thread.value, entry, stack_top, stack_size, priority,
+                       static_cast<uint8_t>(attr));
++    if (entry == 0) { // port/patch_thread_null_entry.py: only for OSRunThread later
++        set_state(thread.value, kNone);
++        field<int32_t>(thread.value, kSuspend) = 0;
++        if (trace_threads()) {
++            std::fprintf(stderr, "ttt2: thread 0x%08X created without entry (for OSRunThread), by 0x%08X\n",
++                         thread.value, current_thread()->guest);
++        }
++        return true;
++    }
+     auto* t = new Thread;
+     t->guest = thread.value;
+     t->core = core_for(static_cast<uint8_t>(attr), current_thread()->core);
+@@ -534,7 +585,14 @@ int32_t OSResumeThread(GuestAddress thread) {
          suspend = previous - 1;
          if (previous == 1 && !t->host_started) {
              set_state(thread.value, kRunning);
@@ -5508,7 +5685,7 @@ index 903c088..55b2d6e 100644
          }
      }
      return previous;
-@@ -635,7 +668,85 @@ uint32_t OSGetCoreCount() { return 3; }
+@@ -635,7 +693,85 @@ uint32_t OSGetCoreCount() { return 3; }
  
  // The main thread is core 1's default thread.
  // shortcut: cores 0 and 2 have no default thread (0); create them if a title runs work on them (OSRunThread).
@@ -5595,7 +5772,7 @@ index 903c088..55b2d6e 100644
  
  uint32_t OSSetThreadDeallocator(GuestAddress thread, uint32_t deallocator) {
      be<uint32_t>& slot = field<uint32_t>(thread.value, kDeallocator);
-@@ -687,6 +798,9 @@ CAFE_EXPORT(coreinit, OSSetThreadSpecific, OSSetThreadSpecific);
+@@ -687,6 +823,9 @@ CAFE_EXPORT(coreinit, OSSetThreadSpecific, OSSetThreadSpecific);
  CAFE_EXPORT(coreinit, OSGetThreadSpecific, OSGetThreadSpecific);
  CAFE_EXPORT(coreinit, OSGetCoreCount, OSGetCoreCount);
  CAFE_EXPORT(coreinit, OSGetDefaultThread, OSGetDefaultThread);
